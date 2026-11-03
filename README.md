@@ -31,6 +31,39 @@ with DB("./data") as db:
     list(db.scan("user:", "user:~"))
 ```
 
+## How it works
+
+**Writes.** `put` and `delete` first append a record to `wal.log`
+(`crc32 | op | klen | vlen | key | value`), then update the memtable, which is just a
+Python dict. A delete stores `None` as a tombstone, because the key may still exist in an
+older table on disk. `fsync` on every write is off by default (`sync=False`), so a crash can
+lose whatever the OS hadn't written to disk yet.
+
+**Flush.** Once the memtable passes `memtable_limit` bytes (1 MiB by default), it's sorted
+and written out as a new SSTable. The order matters for crash safety: write the table to a
+`.tmp` file, fsync it, rename it into place, atomically swap the `MANIFEST` (the list of live
+tables, newest first), and only then truncate the WAL. A crash at any step leaves either the
+old state plus the WAL, or the new state (maybe with the old WAL replayed on top, which is harmless). On startup, `.sst` files the manifest doesn't list
+get deleted, and the WAL is replayed into the memtable, stopping at the first record whose
+CRC doesn't match (that's the torn tail).
+
+**SSTable layout.** `[records][sparse index][bloom filter][footer]`. Records are sorted by
+key. Every 16th key goes into the sparse index with its file offset. The bloom filter uses
+blake2b double hashing, sized for a 1% false positive rate. The footer points at the index
+and the bloom filter.
+
+**Reads.** `get` checks the memtable, then each table from newest to oldest. For each table,
+the bloom filter is checked first (if it says no, the file isn't touched), then a bisect on
+the in-memory sparse index finds the block of up to 16 records to read and scan. The first
+hit wins, and a tombstone counts as "not found".
+
+**Scans and compaction.** A range scan runs `heapq.merge` over the sorted memtable slice
+and every table's iterator, tagged by age, so for duplicate keys the newest version comes
+first and the older ones are skipped. Compaction uses the same merge across all tables,
+writes one new table, and drops tombstones, which is safe because nothing older survives.
+It runs inline when there are `compact_at` tables (4 by default) and always merges
+everything, so on a large db each compaction rewrites all of it.
+
 ## Benchmark
 
 On my box (single thread, 64-byte values, fsync off):
